@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<meta name="theme-color" content="#0d1117">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="description" content="P2P encrypted chat. No server.">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Ghost</title>
+<style>
+:root{--bg:#0d1117;--s:#161b22;--b:#30363d;--t:#c9d1d9;--dim:#8b949e;--acc:#58a6ff;--grn:#3fb950;--red:#f85149;--font:'SF Mono','Fira Code',monospace}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--t);font-family:var(--font);font-size:13px;height:100vh;overflow:hidden}
+button{background:var(--s);color:var(--t);border:1px solid var(--b);padding:8px 16px;font-family:var(--font);font-size:13px;cursor:pointer;border-radius:4px}
+button:hover{border-color:var(--acc);color:#fff}
+button.primary{background:var(--acc);color:#fff;border-color:var(--acc)}
+button.primary:hover{background:#4393e6}
+button.danger{border-color:var(--red);color:var(--red)}
+button.danger:hover{background:var(--red);color:#fff}
+input,textarea{background:var(--bg);color:var(--t);border:1px solid var(--b);padding:8px 12px;font-family:var(--font);font-size:13px;border-radius:4px;width:100%;outline:none}
+input:focus,textarea:focus{border-color:var(--acc)}
+textarea{resize:none}
+.center{display:flex;justify-content:center;align-items:center;height:100vh}
+.box{background:var(--s);border:1px solid var(--b);border-radius:8px;padding:32px;max-width:480px;width:90%}
+.box h1{font-size:24px;margin-bottom:4px;color:#fff}
+.box p{color:var(--dim);margin-bottom:20px;font-size:12px}
+.box label{display:block;color:var(--dim);font-size:11px;margin-bottom:4px;margin-top:16px;text-transform:uppercase;letter-spacing:1px}
+.box .actions{margin-top:20px;display:flex;gap:8px}
+.code-box{position:relative;margin-top:4px}
+.code-box textarea{font-size:11px;min-height:60px}
+.code-box button{position:absolute;top:4px;right:4px;padding:4px 8px;font-size:11px}
+.status{color:var(--dim);font-size:12px;margin-top:12px;display:flex;align-items:center;gap:6px}
+.status .dot{width:6px;height:6px;border-radius:50%;background:var(--dim);animation:pulse 1.5s infinite}
+.status.ok .dot{background:var(--grn);animation:none}
+@keyframes pulse{0%,100%{opacity:.3}50%{opacity:1}}
+.link-box{background:var(--bg);border:1px solid var(--b);border-radius:4px;padding:8px 12px;font-size:11px;word-break:break-all;display:flex;align-items:center;gap:8px;margin-top:4px}
+.link-box span{flex:1;color:var(--acc)}
+.link-box button{flex-shrink:0}
+#chat-view{display:flex;flex-direction:column;height:100vh}
+#chat-header{background:var(--s);border-bottom:1px solid var(--b);padding:10px 16px;display:flex;align-items:center;gap:12px;flex-shrink:0}
+#chat-header .room-name{color:#fff;font-weight:bold}
+#chat-header .peer-count{color:var(--dim);font-size:12px}
+#chat-header .spacer{flex:1}
+#messages{flex:1;overflow-y:auto;padding:12px 16px;display:flex;flex-direction:column;gap:2px}
+.msg{line-height:1.6}
+.msg .ts{color:var(--dim);font-size:11px}
+.msg .nick{font-weight:bold}
+.msg.self .nick{color:var(--acc)}
+.msg.sys{color:var(--dim);font-style:italic}
+.msg.sys .ts{font-style:normal}
+.file-link{color:var(--grn);text-decoration:underline;cursor:pointer}
+#chat-input{background:var(--s);border-top:1px solid var(--b);padding:10px 16px;display:flex;gap:8px;flex-shrink:0;align-items:center}
+#chat-input input{flex:1}
+#chat-input label.file-btn{cursor:pointer;color:var(--dim);padding:4px 8px;border:1px solid var(--b);border-radius:4px;font-size:16px}
+#chat-input label.file-btn:hover{color:var(--t);border-color:var(--acc)}
+.hidden{display:none!important}
+.members-panel{position:fixed;top:0;right:0;width:240px;height:100vh;background:var(--s);border-left:1px solid var(--b);padding:16px;z-index:10;display:flex;flex-direction:column}
+.members-panel h3{margin-bottom:12px;font-size:13px;color:#fff}
+.members-panel .member{padding:4px 0;font-size:12px;color:var(--t);display:flex;align-items:center;gap:6px}
+.members-panel .member .online{width:6px;height:6px;border-radius:50%;background:var(--grn)}
+.members-panel .close-btn{position:absolute;top:12px;right:12px;background:none;border:none;color:var(--dim);cursor:pointer;font-size:16px}
+.invite-section{margin-top:auto;padding-top:16px;border-top:1px solid var(--b)}
+.invite-section label{display:block;color:var(--dim);font-size:11px;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px}
+.toast{position:fixed;top:16px;left:50%;transform:translateX(-50%);background:var(--s);border:1px solid var(--b);padding:8px 16px;border-radius:4px;font-size:12px;z-index:100;opacity:0;transition:opacity .3s}
+.toast.show{opacity:1}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div class="toast" id="toast"></div>
+<script>
+// ============ CONFIG ============
+const STUN = [{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}];
+const ICE_TIMEOUT = 5000;
+const CHUNK_SIZE = 16384;
+const MSG_TTL = 2*24*3600*1000;
+
+// ============ STATE ============
+const S = {
+  roomId: null, roomKey: null, nick: null, isAdmin: false,
+  myId: crypto.randomUUID(),
+  peers: new Map(),       // peerId -> {pc, dc, nick, introducedBy}
+  messages: [],           // chat history
+  pendingPCs: new Map(),  // peerId -> {pc, role}
+  files: new Map(),       // fileId -> {meta, chunks[], done}
+};
+
+// ============ UTIL ============
+const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+const unb64 = s => {s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';return Uint8Array.from(atob(s),c=>c.charCodeAt(0))};
+const rnd = (n=4) => [...crypto.getRandomValues(new Uint8Array(n))].map(b=>b.toString(16).padStart(2,'0')).join('');
+const ts = () => new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+const esc = s => {const d=document.createElement('div');d.textContent=s;return d.innerHTML};
+
+function toast(msg,ms=2000){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),ms)}
+
+// ============ CRYPTO ============
+async function genKey(){return crypto.subtle.generateKey({name:'AES-GCM',length:256},true,['encrypt','decrypt'])}
+async function expKey(k){return b64url(await crypto.subtle.exportKey('raw',k))}
+async function impKey(s){return crypto.subtle.importKey('raw',unb64(s),{name:'AES-GCM'},true,['encrypt','decrypt'])}
+async function enc(key,txt){
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(txt)));
+  const r=new Uint8Array(12+ct.length);r.set(iv);r.set(ct,12);return b64url(r);
+}
+async function dec(key,data){
+  const buf=unb64(data),iv=buf.slice(0,12),ct=buf.slice(12);
+  return new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM',iv},key,ct));
+}
+
+// ============ SDP COMPRESS ============
+async function compressSDP(sdp){
+  const cs=new CompressionStream('deflate');
+  const w=new Blob([sdp]).stream().pipeThrough(cs);
+  return b64url(new Uint8Array(await new Response(w).arrayBuffer()));
+}
+async function decompressSDP(s){
+  const ds=new DecompressionStream('deflate');
+  const w=new Blob([unb64(s)]).stream().pipeThrough(ds);
+  return new Response(w).text();
+}
+
+// ============ WEBRTC ============
+function createPC(){return new RTCPeerConnection({iceServers:STUN})}
+function iceReady(pc){
+  return new Promise(r=>{
+    if(pc.iceGatheringState==='complete')return r();
+    const t=setTimeout(r,ICE_TIMEOUT);
+    pc.onicegatheringstatechange=()=>{if(pc.iceGatheringState==='complete'){clearTimeout(t);r()}};
+  });
+}
+
+async function createOffer(){
+  const pc=createPC();
+  const dc=pc.createDataChannel('ghost',{ordered:true});
+  const offer=await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await iceReady(pc);
+  const code='O:'+await compressSDP(pc.localDescription.sdp);
+  return {pc,dc,code};
+}
+
+async function acceptOffer(offerSDP){
+  const pc=createPC();
+  let dcResolve;
+  const dcPromise=new Promise(r=>{dcResolve=r});
+  pc.ondatachannel=e=>{dcResolve(e.channel)};
+  await pc.setRemoteDescription({type:'offer',sdp:offerSDP});
+  const ans=await pc.createAnswer();
+  await pc.setLocalDescription(ans);
+  await iceReady(pc);
+  const code='A:'+await compressSDP(pc.localDescription.sdp);
+  return {pc,code,dcPromise};
+}
+
+async function acceptAnswer(pc,answerSDP){
+  await pc.setRemoteDescription({type:'answer',sdp:answerSDP});
+}
+
+async function parseCode(code){
+  const type=code[0];
+  const sdp=await decompressSDP(code.slice(2));
+  return {type,sdp};
+}
+
+// ============ PEER MGMT ============
+function setupDC(peerId,dc){
+  dc.onopen=()=>{
+    console.log('connected to',peerId);
+    // send join announcement
+    sendTo(peerId,{type:'join',peerId:S.myId,nick:S.nick});
+    // if we're the one with existing peers, send peer list
+    const others=[...S.peers.keys()].filter(id=>id!==peerId);
+    if(others.length>0) sendTo(peerId,{type:'peer-list',peers:others.map(id=>({id,nick:S.peers.get(id).nick}))});
+    onConnected(peerId);
+  };
+  dc.onclose=()=>onDisconnected(peerId);
+  dc.onerror=e=>console.error('dc error',peerId,e);
+  dc.onmessage=async e=>{
+    try{
+      const json=await dec(S.roomKey,e.data);
+      handleMsg(peerId,JSON.parse(json));
+    }catch(err){console.error('msg decrypt/parse fail',err)}
+  };
+}
+
+function addPeer(peerId,pc,dc,nick){
+  S.peers.set(peerId,{pc,dc,nick:nick||'???'});
+  pc.onconnectionstatechange=()=>{
+    if(pc.connectionState==='failed'||pc.connectionState==='closed')onDisconnected(peerId);
+  };
+}
+
+async function sendTo(peerId,msg){
+  const peer=S.peers.get(peerId);
+  if(!peer||peer.dc.readyState!=='open')return;
+  peer.dc.send(await enc(S.roomKey,JSON.stringify(msg)));
+}
+
+async function broadcast(msg,exclude){
+  const data=await enc(S.roomKey,JSON.stringify(msg));
+  for(const[id,p]of S.peers){
+    if(id!==exclude&&p.dc.readyState==='open')p.dc.send(data);
+  }
+}
+
+function onConnected(peerId){
+  if(document.getElementById('chat-view'))updateChatUI();
+  else showChat();
+}
+
+function onDisconnected(peerId){
+  const peer=S.peers.get(peerId);
+  if(!peer)return;
+  const nick=peer.nick;
+  peer.pc.close();
+  S.peers.delete(peerId);
+  addSysMsg(`${nick} left`);
+  updateChatUI();
+}
+
+// ============ MESH ============
+async function meshConnect(targetId){
+  // create offer for a remote peer, relay through existing connections
+  const pc=createPC();
+  const dc=pc.createDataChannel('ghost',{ordered:true});
+  setupDC(targetId,dc);
+  S.pendingPCs.set(targetId,{pc,dc});
+  addPeer(targetId,pc,dc,null);
+
+  const offer=await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await iceReady(pc);
+  broadcast({type:'relay',target:targetId,from:S.myId,signal:{type:'offer',sdp:pc.localDescription.sdp}});
+}
+
+async function handleRelay(fromPeer,msg){
+  // is this relay for us?
+  if(msg.target===S.myId){
+    if(msg.signal.type==='offer'){
+      const pc=createPC();
+      let dcR;const dcP=new Promise(r=>{dcR=r});
+      pc.ondatachannel=e=>{
+        const dc=e.channel;
+        setupDC(msg.from,dc);
+        addPeer(msg.from,pc,dc,null);
+        dcR(dc);
+      };
+      await pc.setRemoteDescription({type:'offer',sdp:msg.signal.sdp});
+      const ans=await pc.createAnswer();
+      await pc.setLocalDescription(ans);
+      await iceReady(pc);
+      broadcast({type:'relay',target:msg.from,from:S.myId,signal:{type:'answer',sdp:pc.localDescription.sdp}});
+    }else if(msg.signal.type==='answer'){
+      const pending=S.pendingPCs.get(msg.from)||S.peers.get(msg.from);
+      if(pending&&pending.pc)await acceptAnswer(pending.pc,msg.signal.sdp);
+      S.pendingPCs.delete(msg.from);
+    }
+  }else{
+    // forward to target if we're connected
+    const target=S.peers.get(msg.target);
+    if(target&&target.dc.readyState==='open'){
+      sendTo(msg.target,msg);
+    }
+  }
+}
+
+// ============ MESSAGES ============
+function handleMsg(fromPeer,msg){
+  switch(msg.type){
+    case 'chat': addChatMsg(msg); break;
+    case 'join':
+      const peer=S.peers.get(fromPeer);
+      if(peer){peer.nick=msg.nick;updateChatUI()}
+      addSysMsg(`${msg.nick} joined`);
+      break;
+    case 'peer-list':
+      for(const p of msg.peers){
+        if(p.id!==S.myId&&!S.peers.has(p.id)){
+          meshConnect(p.id);
+        }
+      }
+      break;
+    case 'relay': handleRelay(fromPeer,msg); break;
+    case 'sync':
+      for(const m of msg.messages){
+        if(!S.messages.find(x=>x.id===m.id)){S.messages.push(m)}
+      }
+      S.messages.sort((a,b)=>a.ts-b.ts);
+      renderMessages();
+      break;
+    case 'file-offer': handleFileOffer(fromPeer,msg); break;
+    case 'file-chunk': handleFileChunk(msg); break;
+    case 'destroy':
+      addSysMsg('Room destroyed by admin. Clearing data...');
+      setTimeout(()=>{clearRoom();showHome()},2000);
+      break;
+    case 'nick-update':
+      const p2=S.peers.get(fromPeer);
+      if(p2)p2.nick=msg.nick;
+      updateChatUI();
+      break;
+  }
+}
+
+function addChatMsg(msg){
+  S.messages.push(msg);
+  renderMessage(msg);
+  saveMessages();
+  scrollBottom();
+}
+
+function addSysMsg(text){
+  const msg={id:crypto.randomUUID(),type:'sys',text,ts:Date.now()};
+  S.messages.push(msg);
+  renderMessage(msg);
+  saveMessages();
+  scrollBottom();
+}
+
+// ============ FILE TRANSFER ============
+async function sendFile(file){
+  if(file.size>50*1024*1024){toast('Max file size: 50MB');return}
+  const fileId=crypto.randomUUID();
+  const buf=await file.arrayBuffer();
+  const total=Math.ceil(buf.byteLength/CHUNK_SIZE);
+
+  broadcast({type:'file-offer',fileId,name:file.name,size:file.size,total,from:S.myId,nick:S.nick});
+  addChatMsg({id:crypto.randomUUID(),type:'chat',from:S.myId,nick:S.nick,text:`sent file: ${file.name} (${fmtSize(file.size)})`,ts:Date.now(),isFile:true});
+
+  for(let i=0;i<total;i++){
+    const chunk=new Uint8Array(buf.slice(i*CHUNK_SIZE,(i+1)*CHUNK_SIZE));
+    broadcast({type:'file-chunk',fileId,index:i,data:b64url(chunk),total});
+    if(i%10===0)await new Promise(r=>setTimeout(r,10)); // yield
+  }
+}
+
+function handleFileOffer(from,msg){
+  S.files.set(msg.fileId,{meta:msg,chunks:new Array(msg.total),received:0});
+}
+
+function handleFileChunk(msg){
+  const f=S.files.get(msg.fileId);
+  if(!f)return;
+  f.chunks[msg.index]=unb64(msg.data);
+  f.received++;
+  if(f.received===f.total){
+    // reassemble
+    const total=f.chunks.reduce((s,c)=>s+c.length,0);
+    const buf=new Uint8Array(total);
+    let off=0;
+    for(const c of f.chunks){buf.set(c,off);off+=c.length}
+    const blob=new Blob([buf]);
+    const url=URL.createObjectURL(blob);
+    addChatMsg({id:crypto.randomUUID(),type:'chat',from:f.meta.from,nick:f.meta.nick,text:`file ready: ${f.meta.name}`,ts:Date.now(),isFile:true,fileUrl:url,fileName:f.meta.name});
+    S.files.delete(msg.fileId);
+  }
+}
+
+function fmtSize(b){
+  if(b<1024)return b+'B';
+  if(b<1048576)return(b/1024).toFixed(1)+'KB';
+  return(b/1048576).toFixed(1)+'MB';
+}
+
+// ============ STORAGE (IndexedDB) ============
+function openDB(){
+  return new Promise((res,rej)=>{
+    const req=indexedDB.open('ghost-'+S.roomId,1);
+    req.onupgradeneeded=()=>req.result.createObjectStore('msgs',{keyPath:'id'});
+    req.onsuccess=()=>res(req.result);
+    req.onerror=()=>rej(req.error);
+  });
+}
+
+async function saveMessages(){
+  try{
+    const db=await openDB();
+    const tx=db.transaction('msgs','readwrite');
+    const store=tx.objectStore('msgs');
+    for(const m of S.messages)store.put(m);
+    db.close();
+  }catch(e){console.error('save fail',e)}
+}
+
+async function loadMessages(){
+  try{
+    const db=await openDB();
+    const tx=db.transaction('msgs','readonly');
+    const store=tx.objectStore('msgs');
+    return new Promise((res,rej)=>{
+      const req=store.getAll();
+      req.onsuccess=()=>{db.close();res(req.result||[])};
+      req.onerror=()=>{db.close();rej(req.error)};
+    });
+  }catch(e){return[]}
+}
+
+async function clearRoom(){
+  try{indexedDB.deleteDatabase('ghost-'+S.roomId)}catch(e){}
+  S.messages=[];S.peers.forEach(p=>p.pc.close());S.peers.clear();
+}
+
+async function cleanOldMessages(){
+  const cutoff=Date.now()-MSG_TTL;
+  S.messages=S.messages.filter(m=>m.ts>cutoff);
+  await saveMessages();
+}
+
+// ============ UI ============
+const $=id=>document.getElementById(id);
+
+function showHome(){
+  const stored=localStorage.getItem('ghost-nick')||('ghost-'+rnd(2));
+  $('app').innerHTML=`
+    <div class="center"><div class="box">
+      <h1>Ghost</h1>
+      <p>peer-to-peer encrypted chat &middot; no server</p>
+      <label>Nickname</label>
+      <input id="nick-in" value="${esc(stored)}" maxlength="20" spellcheck="false">
+      <div class="actions">
+        <button class="primary" id="btn-create">Create Room</button>
+        <button id="btn-join">Join Room</button>
+      </div>
+    </div></div>`;
+  $('btn-create').onclick=doCreate;
+  $('btn-join').onclick=()=>showJoinInput();
+}
+
+async function doCreate(){
+  S.nick=$('nick-in').value.trim()||'ghost-'+rnd(2);
+  localStorage.setItem('ghost-nick',S.nick);
+  S.roomId=rnd(4);
+  S.roomKey=await genKey();
+  S.isAdmin=true;
+  const keyStr=await expKey(S.roomKey);
+  history.replaceState(null,'','#'+S.roomId+'.'+keyStr);
+
+  $('app').innerHTML=`
+    <div class="center"><div class="box">
+      <h1>Room Created</h1>
+      <label>Share this link</label>
+      <div class="link-box"><span id="room-link"></span><button id="btn-copy-link">copy</button></div>
+      <label>Your connection code</label>
+      <div class="code-box"><textarea id="my-code" readonly rows="3">generating...</textarea><button id="btn-copy-code">copy</button></div>
+      <label>Paste peer's response code</label>
+      <div class="code-box"><textarea id="peer-code" rows="3" placeholder="paste response here..."></textarea></div>
+      <div class="actions"><button class="primary" id="btn-connect">Connect</button></div>
+      <div class="status" id="conn-status"><span class="dot"></span> waiting for peer</div>
+    </div></div>`;
+
+  $('room-link').textContent=location.href;
+  $('btn-copy-link').onclick=()=>{navigator.clipboard.writeText(location.href);toast('Link copied')};
+
+  // generate offer
+  const{pc,dc,code}=await createOffer();
+  $('my-code').value=code;
+  $('btn-copy-code').onclick=()=>{navigator.clipboard.writeText(code);toast('Code copied')};
+
+  const peerId=crypto.randomUUID();
+  setupDC(peerId,dc);
+  addPeer(peerId,pc,dc,null);
+
+  $('btn-connect').onclick=async()=>{
+    const raw=$('peer-code').value.trim();
+    if(!raw||!raw.startsWith('A:')){toast('Paste a valid response code (starts with A:)');return}
+    try{
+      const{sdp}=await parseCode(raw);
+      await acceptAnswer(pc,sdp);
+      $('conn-status').innerHTML='<span class="dot"></span> connecting...';
+    }catch(e){toast('Invalid code: '+e.message)}
+  };
+
+  // sync history if any
+  const old=await loadMessages();
+  if(old.length)S.messages=old.filter(m=>m.ts>Date.now()-MSG_TTL);
+}
+
+function showJoinInput(){
+  const stored=localStorage.getItem('ghost-nick')||('ghost-'+rnd(2));
+  $('app').innerHTML=`
+    <div class="center"><div class="box">
+      <h1>Join Room</h1>
+      <label>Nickname</label>
+      <input id="nick-in" value="${esc(stored)}" maxlength="20" spellcheck="false">
+      <label>Room link or paste from URL</label>
+      <input id="room-url" placeholder="ghost.html#roomid.key" spellcheck="false">
+      <div class="actions"><button class="primary" id="btn-go">Go</button><button id="btn-back">Back</button></div>
+    </div></div>`;
+  $('btn-back').onclick=showHome;
+  $('btn-go').onclick=()=>{
+    const url=$('room-url').value.trim();
+    const hash=url.includes('#')?url.split('#')[1]:url;
+    const[rid,key]=hash.split('.');
+    if(!rid||!key){toast('Invalid link');return}
+    S.nick=$('nick-in').value.trim()||'ghost-'+rnd(2);
+    localStorage.setItem('ghost-nick',S.nick);
+    location.hash=hash;
+    doJoin(rid,key);
+  };
+}
+
+async function doJoin(roomId,keyStr){
+  S.roomId=roomId;
+  S.roomKey=await impKey(keyStr);
+  S.nick=S.nick||localStorage.getItem('ghost-nick')||('ghost-'+rnd(2));
+  localStorage.setItem('ghost-nick',S.nick);
+
+  $('app').innerHTML=`
+    <div class="center"><div class="box">
+      <h1>Join Room</h1>
+      <p>room: ${esc(roomId)}</p>
+      <label>Paste host's connection code</label>
+      <div class="code-box"><textarea id="host-code" rows="3" placeholder="paste code starting with O:..."></textarea></div>
+      <div class="actions"><button class="primary" id="btn-process">Generate Response</button></div>
+      <div id="answer-section" class="hidden">
+        <label>Your response code</label>
+        <div class="code-box"><textarea id="my-answer" readonly rows="3"></textarea><button id="btn-copy-ans">copy</button></div>
+        <p style="color:var(--dim);font-size:11px;margin-top:8px">Send this code back to the host.</p>
+        <div class="status" id="conn-status"><span class="dot"></span> waiting for connection</div>
+      </div>
+    </div></div>`;
+
+  $('btn-process').onclick=async()=>{
+    const raw=$('host-code').value.trim();
+    if(!raw||!raw.startsWith('O:')){toast('Paste a valid host code (starts with O:)');return}
+    try{
+      const{sdp}=await parseCode(raw);
+      const{pc,code,dcPromise}=await acceptOffer(sdp);
+
+      $('answer-section').classList.remove('hidden');
+      $('my-answer').value=code;
+      $('btn-copy-ans').onclick=()=>{navigator.clipboard.writeText(code);toast('Code copied')};
+      $('btn-process').disabled=true;
+
+      const peerId=crypto.randomUUID();
+      const dc=await dcPromise;
+      setupDC(peerId,dc);
+      addPeer(peerId,pc,dc,null);
+    }catch(e){toast('Error: '+e.message);console.error(e)}
+  };
+
+  // load stored messages
+  const old=await loadMessages();
+  if(old.length)S.messages=old.filter(m=>m.ts>Date.now()-MSG_TTL);
+}
+
+function showChat(){
+  $('app').innerHTML=`
+    <div id="chat-view">
+      <div id="chat-header">
+        <span class="room-name">#${esc(S.roomId)}</span>
+        <span class="peer-count" id="peer-count">${S.peers.size} peer${S.peers.size!==1?'s':''}</span>
+        <span class="spacer"></span>
+        <button id="btn-invite" title="Invite">+</button>
+        <button id="btn-members" title="Members">peers</button>
+        ${S.isAdmin?'<button class="danger" id="btn-destroy" title="Destroy room">destroy</button>':''}
+      </div>
+      <div id="messages"></div>
+      <div id="chat-input">
+        <label class="file-btn" title="Send file">&#128206;<input type="file" id="file-in" class="hidden"></label>
+        <input id="msg-in" placeholder="type a message..." autocomplete="off" spellcheck="false">
+        <button id="btn-send">send</button>
+      </div>
+    </div>
+    <div class="members-panel hidden" id="members-panel">
+      <button class="close-btn" id="btn-close-members">&times;</button>
+      <h3>Members</h3>
+      <div id="member-list"></div>
+      <div class="invite-section">
+        <label>Add Peer</label>
+        <p style="color:var(--dim);font-size:11px;margin-bottom:8px">Exchange codes with a new peer</p>
+        <button id="btn-new-offer" style="width:100%">Generate Invite Code</button>
+        <div id="invite-area" class="hidden" style="margin-top:8px">
+          <div class="code-box"><textarea id="invite-code" readonly rows="2" style="font-size:10px"></textarea><button id="btn-copy-invite">copy</button></div>
+          <label style="margin-top:8px">Peer's response</label>
+          <div class="code-box"><textarea id="invite-answer" rows="2" placeholder="paste response..." style="font-size:10px"></textarea></div>
+          <button id="btn-accept-invite" style="width:100%;margin-top:4px">Accept</button>
+        </div>
+      </div>
+    </div>`;
+
+  // render stored messages
+  renderMessages();
+
+  // send history to newly connected peer
+  if(S.messages.length>0){
+    const recent=S.messages.filter(m=>m.ts>Date.now()-MSG_TTL);
+    // send to the most recently connected peer
+    const lastPeer=[...S.peers.keys()].pop();
+    if(lastPeer)sendTo(lastPeer,{type:'sync',messages:recent});
+  }
+
+  // event handlers
+  $('btn-send').onclick=doSend;
+  $('msg-in').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey)doSend()};
+  $('btn-members').onclick=()=>$('members-panel').classList.toggle('hidden');
+  $('btn-close-members').onclick=()=>$('members-panel').classList.add('hidden');
+  $('file-in').onchange=e=>{if(e.target.files[0])sendFile(e.target.files[0]);e.target.value=''};
+
+  // invite flow (for adding more peers from chat view)
+  $('btn-new-offer').onclick=async()=>{
+    $('invite-area').classList.remove('hidden');
+    const{pc,dc,code}=await createOffer();
+    $('invite-code').value=code;
+    $('btn-copy-invite').onclick=()=>{navigator.clipboard.writeText(code);toast('Code copied')};
+
+    const peerId=crypto.randomUUID();
+    setupDC(peerId,dc);
+    addPeer(peerId,pc,dc,null);
+
+    $('btn-accept-invite').onclick=async()=>{
+      const raw=$('invite-answer').value.trim();
+      if(!raw||!raw.startsWith('A:')){toast('Need response code (A:...)');return}
+      const{sdp}=await parseCode(raw);
+      await acceptAnswer(pc,sdp);
+      toast('Connecting...');
+    };
+  };
+
+  $('btn-invite').onclick=()=>{
+    $('members-panel').classList.remove('hidden');
+  };
+
+  if(S.isAdmin&&$('btn-destroy')){
+    $('btn-destroy').onclick=()=>{
+      if(confirm('Destroy this room for everyone?')){
+        broadcast({type:'destroy',from:S.myId});
+        addSysMsg('Room destroyed.');
+        setTimeout(()=>{clearRoom();showHome()},1500);
+      }
+    };
+  }
+
+  // drag and drop files
+  const msgArea=$('messages');
+  msgArea.ondragover=e=>{e.preventDefault();msgArea.style.background='#1a2332'};
+  msgArea.ondragleave=()=>{msgArea.style.background=''};
+  msgArea.ondrop=e=>{e.preventDefault();msgArea.style.background='';if(e.dataTransfer.files[0])sendFile(e.dataTransfer.files[0])};
+
+  updateChatUI();
+  cleanOldMessages();
+}
+
+function doSend(){
+  const input=$('msg-in');
+  const text=input.value.trim();
+  if(!text)return;
+  input.value='';
+  const msg={id:crypto.randomUUID(),type:'chat',from:S.myId,nick:S.nick,text,ts:Date.now()};
+  addChatMsg(msg);
+  broadcast(msg);
+}
+
+function renderMessages(){
+  const el=$('messages');
+  if(!el)return;
+  el.innerHTML='';
+  for(const m of S.messages)renderMessage(m);
+  scrollBottom();
+}
+
+function renderMessage(msg){
+  const el=$('messages');
+  if(!el)return;
+  const div=document.createElement('div');
+  div.className='msg'+(msg.type==='sys'?' sys':'')+(msg.from===S.myId?' self':'');
+  const t=new Date(msg.ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+  if(msg.type==='sys'){
+    div.innerHTML=`<span class="ts">[${t}]</span> -- ${esc(msg.text)}`;
+  }else{
+    let content=esc(msg.text);
+    if(msg.fileUrl){
+      content=`<a class="file-link" href="${msg.fileUrl}" download="${esc(msg.fileName)}">${esc(msg.text)}</a>`;
+    }
+    div.innerHTML=`<span class="ts">[${t}]</span> <span class="nick">${esc(msg.nick)}:</span> ${content}`;
+  }
+  el.appendChild(div);
+}
+
+function scrollBottom(){
+  const el=$('messages');
+  if(el)el.scrollTop=el.scrollHeight;
+}
+
+function updateChatUI(){
+  const pc=$('peer-count');
+  if(pc)pc.textContent=S.peers.size+' peer'+(S.peers.size!==1?'s':'');
+  const ml=$('member-list');
+  if(ml){
+    ml.innerHTML=`<div class="member"><span class="online"></span>${esc(S.nick)} (you)</div>`;
+    for(const[id,p]of S.peers){
+      ml.innerHTML+=`<div class="member"><span class="online"></span>${esc(p.nick||'connecting...')}</div>`;
+    }
+  }
+}
+
+// ============ INIT ============
+(async function init(){
+  const hash=location.hash.slice(1);
+  if(hash&&hash.includes('.')){
+    const[rid,key]=hash.split('.');
+    if(rid&&key){
+      S.nick=localStorage.getItem('ghost-nick')||('ghost-'+rnd(2));
+      await doJoin(rid,key);
+      return;
+    }
+  }
+  showHome();
+})();
+
+// service worker
+if('serviceWorker' in navigator){navigator.serviceWorker.register('sw.js').catch(()=>{})}
+
+// periodic cleanup
+setInterval(()=>{if(S.roomId)cleanOldMessages()},30*60*1000);
+
+// handle page unload
+window.onbeforeunload=()=>{
+  broadcast({type:'leave',peerId:S.myId,nick:S.nick});
+};
+</script>
+</body>
+</html>
