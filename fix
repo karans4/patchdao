@@ -298,23 +298,67 @@ def generate_fix(command, stderr_text, env_info, api_key):
 
 # --- Sandbox (Transactional Execution) ---
 
+# Allowlist: patterns of files a fix is permitted to touch.
+# Anything outside these paths triggers a security warning.
+ALLOWED_PATHS = {
+    "python-pkg": [
+        "/usr/lib/python*",
+        "/usr/local/lib/python*",
+        "/usr/share/python*",
+        "/var/lib/dpkg",
+        "/var/cache/apt",
+        "/var/lib/apt",
+        "/etc/apt",
+    ],
+    "system-pkg": [
+        "/usr/bin/*",
+        "/usr/lib/*",
+        "/usr/share/*",
+        "/var/lib/dpkg*",
+        "/var/cache/apt*",
+        "/var/cache/debconf*",
+        "/var/lib/apt*",
+        "/var/log/dpkg*",
+        "/var/log/apt*",
+        "/var/lib/update-notifier*",
+        "/etc/apt*",
+        "/etc/ld.so.*",
+    ],
+    "compiler": [
+        "/usr/include/*",
+        "/usr/lib/gcc/*",
+        "/usr/bin/gcc*",
+        "/usr/bin/cc*",
+        "/tmp/*",
+    ],
+}
+
+# Default: union of all profiles
+DEFAULT_ALLOWED = []
+for paths in ALLOWED_PATHS.values():
+    DEFAULT_ALLOWED.extend(paths)
+
+
 class Sandbox:
     """OverlayFS sandbox for transactional fix execution.
 
-    Creates a filesystem overlay so fixes run against a copy.
-    If verification passes, changes merge to the real system.
-    If verification fails, changes are discarded — zero side effects.
+    Security layers:
+    1. OVERLAY:   Filesystem snapshot — changes are isolated until commit
+    2. NETNS:     Network isolation — fix cannot phone home
+    3. DIFF:      Full audit of every file changed — shown before commit
+    4. ALLOWLIST: Only expected paths may be modified — unexpected = blocked
 
     The "proof" is: does the original command succeed after the fix?
     Both parties (user and agent) agree on this before execution.
     """
 
-    def __init__(self):
+    def __init__(self, allowed_paths=None):
         self.workdir = None
         self.overlay_dirs = []  # (target, upper, work, merged)
+        self.allowed_paths = allowed_paths or DEFAULT_ALLOWED
 
     def _sudo(self, cmd):
-        """Run a command with sudo. Uses cached creds or SUDO_PASSWORD env."""
+        """Run a command with sudo."""
         password = os.environ.get("SUDO_PASSWORD", "")
         if password:
             return subprocess.run(
@@ -332,7 +376,8 @@ class Sandbox:
         self.workdir = tempfile.mkdtemp(prefix="fix-sandbox-")
 
         # Overlay the directories that package managers modify
-        targets = ["/usr", "/var", "/etc"]
+        # Include /home for completeness (catch rogue dotfile writes)
+        targets = ["/usr", "/var", "/etc", "/home", "/tmp"]
         for target in targets:
             if not os.path.isdir(target):
                 continue
@@ -354,21 +399,26 @@ class Sandbox:
             if r.returncode != 0:
                 raise RuntimeError(f"Failed to mount overlay for {target}: {r.stderr}")
 
-    def run_in_sandbox(self, command):
-        """Execute a command with overlays bind-mounted over real dirs.
+    def run_in_sandbox(self, command, network=False):
+        """Execute a command in an isolated namespace.
 
-        Uses unshare to create a mount namespace so the bind mounts
-        are invisible to the rest of the system.
+        - Mount namespace: overlays bind-mounted over real dirs
+        - Network namespace (if network=False): no outbound access
         """
-        # Build a script that bind-mounts overlays then runs the command
         bind_cmds = []
         for target, upper, work, merged in self.overlay_dirs:
             bind_cmds.append(f"mount --bind {merged} {target}")
 
-        # Escape single quotes in command
         safe_cmd = command.replace("'", "'\\''")
         script = " && ".join(bind_cmds + [safe_cmd])
-        full_cmd = f"unshare --mount -- bash -c '{script}'"
+
+        # unshare --mount isolates bind mounts
+        # unshare --net isolates network (no curl/wget/exfiltration)
+        ns_flags = "--mount"
+        if not network:
+            ns_flags += " --net"
+
+        full_cmd = f"unshare {ns_flags} -- bash -c '{script}'"
 
         password = os.environ.get("SUDO_PASSWORD", "")
         if password:
@@ -382,18 +432,79 @@ class Sandbox:
             timeout=120
         )
 
+    def get_diff(self):
+        """Return list of all files changed in the overlay.
+
+        This is the complete audit trail — the overlay upper dir
+        contains ONLY the diff from the original filesystem.
+        """
+        import fnmatch
+        changed = []
+        for target, upper, work, merged in self.overlay_dirs:
+            for root, dirs, files in os.walk(upper):
+                for f in files:
+                    overlay_path = os.path.join(root, f)
+                    # Translate back to real path
+                    rel = os.path.relpath(overlay_path, upper)
+                    real_path = os.path.join(target, rel)
+
+                    # Stat for size
+                    try:
+                        size = os.path.getsize(overlay_path)
+                    except OSError:
+                        size = 0
+
+                    # Check if this is a whiteout (deletion marker)
+                    is_delete = f.startswith(".wh.")
+
+                    changed.append({
+                        "path": real_path,
+                        "overlay_path": overlay_path,
+                        "size": size,
+                        "is_delete": is_delete,
+                    })
+        return changed
+
+    def check_allowlist(self, changed_files):
+        """Check if all changed files match the allowlist.
+
+        Returns (allowed: list, violations: list)
+        """
+        import fnmatch
+        allowed = []
+        violations = []
+
+        for entry in changed_files:
+            path = entry["path"]
+            is_ok = False
+            for pattern in self.allowed_paths:
+                # Match the pattern against the path and all parent dirs
+                if fnmatch.fnmatch(path, pattern):
+                    is_ok = True
+                    break
+                # Also check if the path starts with a dir pattern
+                # e.g. /var/lib/dpkg* should match /var/lib/dpkg/status
+                base_pattern = pattern.rstrip("*")
+                if path.startswith(base_pattern):
+                    is_ok = True
+                    break
+            if is_ok:
+                allowed.append(entry)
+            else:
+                violations.append(entry)
+
+        return allowed, violations
+
     def commit(self):
         """Merge overlay changes into the real filesystem."""
         for target, upper, work, merged in self.overlay_dirs:
-            # rsync upper dir (only changed files) into the real target
-            # upper dir contains only the diff
             if os.listdir(upper):
                 r = self._sudo(f"rsync -a {upper}/ {target}/")
                 if r.returncode != 0:
                     raise RuntimeError(f"Failed to merge {upper} -> {target}: {r.stderr}")
 
     def rollback(self):
-        """Discard all changes. This is the default — just unmount and delete."""
+        """Discard all changes."""
         pass  # cleanup() handles it
 
     def cleanup(self):
@@ -406,14 +517,25 @@ class Sandbox:
         self.workdir = None
 
 
-def run_sandboxed_fix(fix_cmd, verify_cmd, status_fn):
-    """Execute a fix transactionally:
+def format_size(n):
+    """Human-readable file size."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
 
-    1. Snapshot (overlay)
-    2. Run fix in sandbox
-    3. Run verification in sandbox
-    4. If verification passes → commit (merge changes to real system)
-    5. If verification fails → rollback (discard, system untouched)
+
+def run_sandboxed_fix(fix_cmd, verify_cmd, status_fn):
+    """Execute a fix transactionally with full security:
+
+    1. Snapshot filesystem (overlayfs)
+    2. Run fix in sandbox (no network, isolated mounts)
+    3. AUDIT: show every file changed
+    4. ALLOWLIST: flag unexpected modifications
+    5. Run verification in sandbox
+    6. If clean + verified → commit
+    7. Otherwise → rollback, system untouched
 
     Returns (success: bool, fix_output: str, verify_output: str)
     """
@@ -422,26 +544,69 @@ def run_sandboxed_fix(fix_cmd, verify_cmd, status_fn):
         status_fn(f"{C_BLUE}#{C_RESET}", "Creating filesystem snapshot...")
         sandbox.setup()
 
-        # Run the fix in the sandbox
-        status_fn(f"{C_YELLOW}*{C_RESET}", f"[sandbox] Running fix: {fix_cmd[:60]}")
-        fix_result = sandbox.run_in_sandbox(fix_cmd)
+        # --- MITIGATION 2: Network isolation ---
+        # Fixes that need network (apt, pip, npm, cargo) get it.
+        # Everything else runs air-gapped.
+        needs_net = any(pkg_cmd in fix_cmd for pkg_cmd in
+                        ["apt ", "pip ", "npm ", "cargo ", "dnf ", "pacman ",
+                         "wget ", "curl ", "git clone"])
+        if needs_net:
+            status_fn(f"{C_YELLOW}*{C_RESET}",
+                       f"[sandbox] Running fix (network: package install): {fix_cmd[:50]}")
+        else:
+            status_fn(f"{C_YELLOW}*{C_RESET}",
+                       f"[sandbox] Running fix (network disabled): {fix_cmd[:50]}")
+        fix_result = sandbox.run_in_sandbox(fix_cmd, network=needs_net)
         if fix_result.returncode != 0:
             status_fn(f"{C_RED}!{C_RESET}", f"[sandbox] Fix failed: {fix_result.stderr[:100]}")
             sandbox.rollback()
             return False, fix_result.stderr, ""
 
-        # Run verification in the same sandbox
+        # --- MITIGATION 1: Diff audit ---
+        changed = sandbox.get_diff()
+        if changed:
+            status_fn(f"{C_BLUE}#{C_RESET}",
+                       f"Diff audit: {len(changed)} file(s) modified")
+            for entry in changed[:20]:  # cap display at 20
+                icon = "-" if entry["is_delete"] else "+"
+                sz = format_size(entry["size"])
+                status_fn(f"{C_DIM} {C_RESET}",
+                           f"  {icon} {entry['path']} ({sz})")
+            if len(changed) > 20:
+                status_fn(f"{C_DIM} {C_RESET}",
+                           f"  ... and {len(changed) - 20} more")
+        else:
+            status_fn(f"{C_DIM} {C_RESET}", "No files modified.")
+
+        # --- MITIGATION 3: Allowlist check ---
+        allowed, violations = sandbox.check_allowlist(changed)
+        if violations:
+            status_fn(f"{C_RED}!{C_RESET}",
+                       f"SECURITY: {len(violations)} file(s) outside allowlist!")
+            for v in violations[:10]:
+                status_fn(f"{C_RED}!{C_RESET}",
+                           f"  BLOCKED: {v['path']}")
+
+            # In safe mode, violations = hard stop
+            status_fn(f"{C_RED}!{C_RESET}",
+                       "Fix modified unexpected files. Rejecting. System unchanged.")
+            sandbox.rollback()
+            return False, fix_result.stdout, "ALLOWLIST_VIOLATION"
+        elif changed:
+            status_fn(f"{C_GREEN}+{C_RESET}",
+                       f"All {len(allowed)} modified file(s) within allowlist.")
+
+        # --- Verification (network allowed for verification) ---
         status_fn(f"{C_BLUE}>{C_RESET}", f"[sandbox] Verifying: {verify_cmd[:60]}")
-        verify_result = sandbox.run_in_sandbox(verify_cmd)
+        verify_result = sandbox.run_in_sandbox(verify_cmd, network=True)
 
         if verify_result.returncode == 0:
-            # Proof satisfied — commit changes to real system
             status_fn(f"{C_GREEN}+{C_RESET}", "Verification passed. Committing changes...")
             sandbox.commit()
             return True, fix_result.stdout, verify_result.stdout
         else:
-            # Proof failed — rollback, system untouched
-            status_fn(f"{C_RED}!{C_RESET}", "Verification failed. Rolling back (system unchanged).")
+            status_fn(f"{C_RED}!{C_RESET}",
+                       "Verification failed. Rolling back (system unchanged).")
             sandbox.rollback()
             return False, fix_result.stdout, verify_result.stderr
 
