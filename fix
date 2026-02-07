@@ -170,6 +170,10 @@ def error_hash(stderr_text):
 
 # --- LLM Agent ---
 
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "qwen2.5-coder:1.5b"
+
+
 def call_claude(prompt, api_key):
     """Call Claude API via httpx. Returns the text response."""
     import httpx
@@ -196,9 +200,39 @@ def call_claude(prompt, api_key):
     return data["content"][0]["text"]
 
 
-def generate_fix(command, stderr_text, env_info, api_key):
-    """Ask Claude to generate a fix for the failed command."""
-    prompt = f"""You are a DevOps agent. A command failed. Generate a fix.
+def call_ollama(prompt):
+    """Call local Ollama instance. Returns the text response."""
+    import httpx
+
+    resp = httpx.post(
+        OLLAMA_URL,
+        json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+        },
+        timeout=60,
+    )
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"Ollama error {resp.status_code}: {resp.text[:200]}")
+
+    return resp.json()["response"]
+
+
+def ollama_available():
+    """Check if Ollama is running."""
+    try:
+        import httpx
+        resp = httpx.get("http://localhost:11434/api/tags", timeout=2)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def build_prompt(command, stderr_text, env_info):
+    """Build the fix prompt (shared between backends)."""
+    return f"""You are a DevOps agent. A command failed. Generate a fix.
 
 FAILED COMMAND: {command}
 
@@ -222,17 +256,43 @@ Use sudo for apt/dnf/pacman commands (they require root).
 Use pip install --break-system-packages if apt doesn't have the package.
 Combine commands with && for atomicity."""
 
-    raw = call_claude(prompt, api_key)
 
-    # Parse JSON from response (handle markdown fences)
+def parse_llm_response(raw):
+    """Parse JSON from LLM response (handles markdown fences)."""
     text = raw.strip()
     if text.startswith("```"):
         text = "\n".join(text.split("\n")[1:])
         if text.endswith("```"):
             text = text[:-3]
         text = text.strip()
-
+    # Try to extract JSON if there's surrounding text
+    if not text.startswith("{"):
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            text = text[start:end]
     return json.loads(text)
+
+
+def generate_fix(command, stderr_text, env_info, api_key):
+    """Ask an LLM to generate a fix. Tries Claude first, falls back to Ollama."""
+    prompt = build_prompt(command, stderr_text, env_info)
+
+    # Choose backend: Claude API > Ollama
+    backend = None
+    if api_key:
+        backend = "claude"
+    elif ollama_available():
+        backend = "ollama"
+    else:
+        raise RuntimeError("No LLM backend available (no API key, Ollama not running)")
+
+    if backend == "claude":
+        raw = call_claude(prompt, api_key)
+    else:
+        raw = call_ollama(prompt)
+
+    return parse_llm_response(raw), backend
 
 
 # --- UI ---
@@ -347,34 +407,42 @@ def run_fix(args):
         return retry.returncode
 
     # Cache miss — ask the LLM
-    api_key = get_api_key()
-    if not api_key:
-        status(f"{C_RED}!{C_RESET}", "No fix in cache and no API key.")
-        status(f"{C_DIM}i{C_RESET}", "Set ANTHROPIC_API_KEY or write key to ~/.patchdao/api_key")
+    api_key = None if os.environ.get("FIX_FORCE_LOCAL") else get_api_key()
+    use_ollama = ollama_available()
+
+    if not api_key and not use_ollama:
+        status(f"{C_RED}!{C_RESET}", "No fix in cache, no API key, and Ollama not running.")
+        status(f"{C_DIM}i{C_RESET}", "Set ANTHROPIC_API_KEY or start Ollama (ollama serve)")
         return proc.returncode
 
-    if session_spend + COST_PER_CALL_CENTS > budget:
-        status(f"{C_RED}!{C_RESET}", f"Budget exhausted (${session_spend/100:.2f}/${budget/100:.2f})")
-        return proc.returncode
+    if api_key and session_spend + COST_PER_CALL_CENTS > budget:
+        if use_ollama:
+            api_key = None  # fall back to free local model
+            status(f"{C_DIM}i{C_RESET}", "Budget exhausted, falling back to Ollama.")
+        else:
+            status(f"{C_RED}!{C_RESET}", f"Budget exhausted (${session_spend/100:.2f}/${budget/100:.2f})")
+            return proc.returncode
 
-    status(f"{C_YELLOW}@{C_RESET}", "Cache miss. Asking Claude...")
+    backend_name = "Claude" if api_key else "Ollama"
+    status(f"{C_YELLOW}@{C_RESET}", f"Cache miss. Asking {backend_name}...")
 
     for attempt in range(MAX_RETRIES):
         try:
-            result = generate_fix(command, proc.stderr, env_info, api_key)
+            result, backend_used = generate_fix(command, proc.stderr, env_info, api_key)
             break
         except json.JSONDecodeError:
             if attempt < MAX_RETRIES - 1:
                 status(f"{C_DIM}~{C_RESET}", "Bad response, retrying...")
                 continue
-            status(f"{C_RED}!{C_RESET}", "Could not parse fix from Claude.")
+            status(f"{C_RED}!{C_RESET}", f"Could not parse fix from {backend_name}.")
             return proc.returncode
         except RuntimeError as e:
             status(f"{C_RED}!{C_RESET}", str(e))
             return proc.returncode
 
-    inc_stat(conn, "session_spend_cents", COST_PER_CALL_CENTS)
-    inc_stat(conn, "total_spend_cents", COST_PER_CALL_CENTS)
+    if backend_used == "claude":
+        inc_stat(conn, "session_spend_cents", COST_PER_CALL_CENTS)
+        inc_stat(conn, "total_spend_cents", COST_PER_CALL_CENTS)
     inc_stat(conn, "fixes_generated")
 
     fix_cmd = result["fix"]
@@ -384,7 +452,8 @@ def run_fix(args):
     status(f"{C_GREEN}${C_RESET}", f"Fix: {C_BOLD}{fix_cmd[:80]}{C_RESET}")
     if explanation:
         status(f"{C_DIM}i{C_RESET}", explanation)
-    status(f"{C_DIM}~{C_RESET}", f"Cost: ~${COST_PER_CALL_CENTS/100:.4f}")
+    cost_str = f"~${COST_PER_CALL_CENTS/100:.4f}" if backend_used == "claude" else "free (local)"
+    status(f"{C_DIM}~{C_RESET}", f"Cost: {cost_str} [{backend_used}]")
 
     if os.environ.get("FIX_AUTO_YES"):
         pass
@@ -445,6 +514,9 @@ def main():
     if "-y" in args or "--yes" in args:
         os.environ["FIX_AUTO_YES"] = "1"
         args = [a for a in args if a not in ("-y", "--yes")]
+    if "--local" in args or "--ollama" in args:
+        os.environ["FIX_FORCE_LOCAL"] = "1"
+        args = [a for a in args if a not in ("--local", "--ollama")]
     sys.exit(run_fix(args))
 
 
