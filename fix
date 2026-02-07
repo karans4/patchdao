@@ -217,7 +217,10 @@ Respond with ONLY a JSON object, no markdown, no explanation:
 
 The "fix" field should contain shell commands that fix the underlying issue.
 Set "retry" to true if the original command should be re-run after the fix.
-Keep it minimal. Prefer the system package manager. Never use sudo unless absolutely necessary."""
+Keep it minimal. Prefer the system package manager.
+Use sudo for apt/dnf/pacman commands (they require root).
+Use pip install --break-system-packages if apt doesn't have the package.
+Combine commands with && for atomicity."""
 
     raw = call_claude(prompt, api_key)
 
@@ -316,9 +319,14 @@ def run_fix(args):
         status(f"{C_GREEN}${C_RESET}", f"Cache hit ({match_type}): {C_DIM}{cached_fix[:60]}{C_RESET}")
         inc_stat(conn, "fixes_served")
 
-        confirm = input(f"  ?  Apply cached fix? [Y/n] ")
-        if confirm.strip().lower() == "n":
-            return proc.returncode
+        if os.environ.get("FIX_AUTO_YES"):
+            pass
+        elif sys.stdin.isatty():
+            confirm = input(f"  ?  Apply cached fix? [Y/n] ")
+            if confirm.strip().lower() == "n":
+                return proc.returncode
+        else:
+            status(f"{C_DIM}i{C_RESET}", "Non-interactive mode, auto-applying.")
 
         status(f"{C_YELLOW}*{C_RESET}", "Applying fix...")
         fix_proc = subprocess.run(cached_fix, shell=True)
@@ -378,9 +386,14 @@ def run_fix(args):
         status(f"{C_DIM}i{C_RESET}", explanation)
     status(f"{C_DIM}~{C_RESET}", f"Cost: ~${COST_PER_CALL_CENTS/100:.4f}")
 
-    confirm = input(f"  ?  Apply this fix? [Y/n] ")
-    if confirm.strip().lower() == "n":
-        return proc.returncode
+    if os.environ.get("FIX_AUTO_YES"):
+        pass
+    elif sys.stdin.isatty():
+        confirm = input(f"  ?  Apply this fix? [Y/n] ")
+        if confirm.strip().lower() == "n":
+            return proc.returncode
+    else:
+        status(f"{C_DIM}i{C_RESET}", "Non-interactive mode, auto-applying.")
 
     status(f"{C_YELLOW}*{C_RESET}", "Applying fix...")
     fix_proc = subprocess.run(fix_cmd, shell=True)
@@ -428,7 +441,11 @@ def main():
         print("Cache cleared.")
         return
 
-    sys.exit(run_fix(sys.argv[1:]))
+    args = sys.argv[1:]
+    if "-y" in args or "--yes" in args:
+        os.environ["FIX_AUTO_YES"] = "1"
+        args = [a for a in args if a not in ("-y", "--yes")]
+    sys.exit(run_fix(args))
 
 
 if __name__ == "__main__":
