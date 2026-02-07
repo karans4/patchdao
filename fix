@@ -3,6 +3,7 @@
 
 Usage:
     fix <command>           Run command; if it fails, find/generate a fix
+    fix --safe <command>    Sandboxed mode: overlay snapshot + rollback on failure
     fix --cache             Show cached fixes
     fix --stats             Show spending stats
     fix --clear             Clear the fix cache
@@ -295,6 +296,163 @@ def generate_fix(command, stderr_text, env_info, api_key):
     return parse_llm_response(raw), backend
 
 
+# --- Sandbox (Transactional Execution) ---
+
+class Sandbox:
+    """OverlayFS sandbox for transactional fix execution.
+
+    Creates a filesystem overlay so fixes run against a copy.
+    If verification passes, changes merge to the real system.
+    If verification fails, changes are discarded — zero side effects.
+
+    The "proof" is: does the original command succeed after the fix?
+    Both parties (user and agent) agree on this before execution.
+    """
+
+    def __init__(self):
+        self.workdir = None
+        self.overlay_dirs = []  # (target, upper, work, merged)
+
+    def _sudo(self, cmd):
+        """Run a command with sudo. Uses cached creds or SUDO_PASSWORD env."""
+        password = os.environ.get("SUDO_PASSWORD", "")
+        if password:
+            return subprocess.run(
+                f"echo '{password}' | sudo -S {cmd}", shell=True,
+                capture_output=True, text=True
+            )
+        return subprocess.run(
+            f"sudo {cmd}", shell=True,
+            capture_output=True, text=True
+        )
+
+    def setup(self):
+        """Create overlay workspace."""
+        import tempfile
+        self.workdir = tempfile.mkdtemp(prefix="fix-sandbox-")
+
+        # Overlay the directories that package managers modify
+        targets = ["/usr", "/var", "/etc"]
+        for target in targets:
+            if not os.path.isdir(target):
+                continue
+            name = target.strip("/").replace("/", "_")
+            upper = os.path.join(self.workdir, f"{name}_upper")
+            work = os.path.join(self.workdir, f"{name}_work")
+            merged = os.path.join(self.workdir, f"{name}_merged")
+            os.makedirs(upper)
+            os.makedirs(work)
+            os.makedirs(merged)
+            self.overlay_dirs.append((target, upper, work, merged))
+
+        # Mount overlays
+        for target, upper, work, merged in self.overlay_dirs:
+            r = self._sudo(
+                f"mount -t overlay overlay "
+                f"-o lowerdir={target},upperdir={upper},workdir={work} {merged}"
+            )
+            if r.returncode != 0:
+                raise RuntimeError(f"Failed to mount overlay for {target}: {r.stderr}")
+
+    def run_in_sandbox(self, command):
+        """Execute a command with overlays bind-mounted over real dirs.
+
+        Uses unshare to create a mount namespace so the bind mounts
+        are invisible to the rest of the system.
+        """
+        # Build a script that bind-mounts overlays then runs the command
+        bind_cmds = []
+        for target, upper, work, merged in self.overlay_dirs:
+            bind_cmds.append(f"mount --bind {merged} {target}")
+
+        # Escape single quotes in command
+        safe_cmd = command.replace("'", "'\\''")
+        script = " && ".join(bind_cmds + [safe_cmd])
+        full_cmd = f"unshare --mount -- bash -c '{script}'"
+
+        password = os.environ.get("SUDO_PASSWORD", "")
+        if password:
+            full_cmd = f"echo '{password}' | sudo -S {full_cmd}"
+        else:
+            full_cmd = f"sudo {full_cmd}"
+
+        return subprocess.run(
+            full_cmd, shell=True,
+            capture_output=True, text=True,
+            timeout=120
+        )
+
+    def commit(self):
+        """Merge overlay changes into the real filesystem."""
+        for target, upper, work, merged in self.overlay_dirs:
+            # rsync upper dir (only changed files) into the real target
+            # upper dir contains only the diff
+            if os.listdir(upper):
+                r = self._sudo(f"rsync -a {upper}/ {target}/")
+                if r.returncode != 0:
+                    raise RuntimeError(f"Failed to merge {upper} -> {target}: {r.stderr}")
+
+    def rollback(self):
+        """Discard all changes. This is the default — just unmount and delete."""
+        pass  # cleanup() handles it
+
+    def cleanup(self):
+        """Unmount overlays and delete workspace."""
+        if not self.workdir:
+            return
+        for target, upper, work, merged in self.overlay_dirs:
+            self._sudo(f"umount {merged} 2>/dev/null")
+        self._sudo(f"rm -rf {self.workdir}")
+        self.workdir = None
+
+
+def run_sandboxed_fix(fix_cmd, verify_cmd, status_fn):
+    """Execute a fix transactionally:
+
+    1. Snapshot (overlay)
+    2. Run fix in sandbox
+    3. Run verification in sandbox
+    4. If verification passes → commit (merge changes to real system)
+    5. If verification fails → rollback (discard, system untouched)
+
+    Returns (success: bool, fix_output: str, verify_output: str)
+    """
+    sandbox = Sandbox()
+    try:
+        status_fn(f"{C_BLUE}#{C_RESET}", "Creating filesystem snapshot...")
+        sandbox.setup()
+
+        # Run the fix in the sandbox
+        status_fn(f"{C_YELLOW}*{C_RESET}", f"[sandbox] Running fix: {fix_cmd[:60]}")
+        fix_result = sandbox.run_in_sandbox(fix_cmd)
+        if fix_result.returncode != 0:
+            status_fn(f"{C_RED}!{C_RESET}", f"[sandbox] Fix failed: {fix_result.stderr[:100]}")
+            sandbox.rollback()
+            return False, fix_result.stderr, ""
+
+        # Run verification in the same sandbox
+        status_fn(f"{C_BLUE}>{C_RESET}", f"[sandbox] Verifying: {verify_cmd[:60]}")
+        verify_result = sandbox.run_in_sandbox(verify_cmd)
+
+        if verify_result.returncode == 0:
+            # Proof satisfied — commit changes to real system
+            status_fn(f"{C_GREEN}+{C_RESET}", "Verification passed. Committing changes...")
+            sandbox.commit()
+            return True, fix_result.stdout, verify_result.stdout
+        else:
+            # Proof failed — rollback, system untouched
+            status_fn(f"{C_RED}!{C_RESET}", "Verification failed. Rolling back (system unchanged).")
+            sandbox.rollback()
+            return False, fix_result.stdout, verify_result.stderr
+
+    except Exception as e:
+        status_fn(f"{C_RED}!{C_RESET}", f"Sandbox error: {e}")
+        sandbox.rollback()
+        return False, "", str(e)
+    finally:
+        sandbox.cleanup()
+
+
 # --- UI ---
 
 C_RESET = "\033[0m"
@@ -464,28 +622,47 @@ def run_fix(args):
     else:
         status(f"{C_DIM}i{C_RESET}", "Non-interactive mode, auto-applying.")
 
-    status(f"{C_YELLOW}*{C_RESET}", "Applying fix...")
-    fix_proc = subprocess.run(fix_cmd, shell=True)
+    # --- Execute fix (sandboxed or direct) ---
+    safe_mode = os.environ.get("FIX_SAFE_MODE")
 
-    if fix_proc.returncode != 0:
-        status(f"{C_RED}!{C_RESET}", "Fix command failed.")
-        return fix_proc.returncode
+    if safe_mode:
+        # Transactional execution: snapshot → fix → verify → commit/rollback
+        status(f"{C_BLUE}#{C_RESET}", "Safe mode: fix runs in sandbox with rollback.")
+        status(f"{C_DIM}i{C_RESET}", f"Contract: apply fix, then verify '{command}' succeeds.")
 
-    if should_retry:
-        status(f"{C_BLUE}>{C_RESET}", f"Retrying: {command}")
-        retry = subprocess.run(command, shell=True)
+        success, fix_out, verify_out = run_sandboxed_fix(fix_cmd, command, status)
 
-        if retry.returncode == 0:
-            status(f"{C_GREEN}+{C_RESET}", "Fixed! Caching solution.")
+        if success:
+            status(f"{C_GREEN}+{C_RESET}", "Contract satisfied. Changes committed.")
             store_fix(conn, ehash, envhash, fix_cmd)
             return 0
         else:
-            status(f"{C_RED}!{C_RESET}", "Still failing. Fix not cached.")
-            return retry.returncode
+            status(f"{C_RED}!{C_RESET}", "Contract not satisfied. System unchanged.")
+            return 1
     else:
-        status(f"{C_GREEN}+{C_RESET}", "Fix applied. Caching solution.")
-        store_fix(conn, ehash, envhash, fix_cmd)
-        return 0
+        # Direct execution (original behavior)
+        status(f"{C_YELLOW}*{C_RESET}", "Applying fix...")
+        fix_proc = subprocess.run(fix_cmd, shell=True)
+
+        if fix_proc.returncode != 0:
+            status(f"{C_RED}!{C_RESET}", "Fix command failed.")
+            return fix_proc.returncode
+
+        if should_retry:
+            status(f"{C_BLUE}>{C_RESET}", f"Retrying: {command}")
+            retry = subprocess.run(command, shell=True)
+
+            if retry.returncode == 0:
+                status(f"{C_GREEN}+{C_RESET}", "Fixed! Caching solution.")
+                store_fix(conn, ehash, envhash, fix_cmd)
+                return 0
+            else:
+                status(f"{C_RED}!{C_RESET}", "Still failing. Fix not cached.")
+                return retry.returncode
+        else:
+            status(f"{C_GREEN}+{C_RESET}", "Fix applied. Caching solution.")
+            store_fix(conn, ehash, envhash, fix_cmd)
+            return 0
 
 
 def main():
@@ -517,6 +694,9 @@ def main():
     if "--local" in args or "--ollama" in args:
         os.environ["FIX_FORCE_LOCAL"] = "1"
         args = [a for a in args if a not in ("--local", "--ollama")]
+    if "--safe" in args:
+        os.environ["FIX_SAFE_MODE"] = "1"
+        args = [a for a in args if a != "--safe"]
     sys.exit(run_fix(args))
 
 
