@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""fix — AI-powered command fixer. The core loop of PatchDAO.
+
+Usage:
+    fix <command>           Run command; if it fails, find/generate a fix
+    fix --cache             Show cached fixes
+    fix --stats             Show spending stats
+    fix --clear             Clear the fix cache
+    fix --budget <cents>    Set max spend per session (default: 50 cents)
+"""
+
+import subprocess
+import hashlib
+import sqlite3
+import sys
+import os
+import json
+import time
+import platform
+import shutil
+
+# --- Config ---
+DB_DIR = os.path.expanduser("~/.patchdao")
+DB_PATH = os.path.join(DB_DIR, "fixes.db")
+MAX_RETRIES = 3
+DEFAULT_BUDGET_CENTS = 50  # half a dollar
+
+# Claude API
+API_URL = "https://api.anthropic.com/v1/messages"
+MODEL = "claude-haiku-4-5-20251001"  # cheap and fast
+
+# Rough cost estimate: ~$0.25/MTok input, $1.25/MTok output for haiku
+# Average fix query ~2k tokens in, ~500 tokens out ≈ $0.001 per call
+COST_PER_CALL_CENTS = 0.1  # conservative estimate
+
+
+def get_api_key():
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        keyfile = os.path.expanduser("~/.patchdao/api_key")
+        if os.path.exists(keyfile):
+            with open(keyfile) as f:
+                key = f.read().strip()
+    return key
+
+
+# --- Database ---
+
+def init_db():
+    os.makedirs(DB_DIR, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fixes (
+            error_hash TEXT,
+            env_hash TEXT,
+            fix_script TEXT,
+            success_count INTEGER DEFAULT 0,
+            fail_count INTEGER DEFAULT 0,
+            created_at REAL,
+            PRIMARY KEY (error_hash, env_hash)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stats (
+            key TEXT PRIMARY KEY,
+            value REAL
+        )
+    """)
+    # init spend tracker
+    conn.execute("INSERT OR IGNORE INTO stats VALUES ('total_spend_cents', 0)")
+    conn.execute("INSERT OR IGNORE INTO stats VALUES ('session_spend_cents', 0)")
+    conn.execute("INSERT OR IGNORE INTO stats VALUES ('fixes_served', 0)")
+    conn.execute("INSERT OR IGNORE INTO stats VALUES ('fixes_generated', 0)")
+    conn.commit()
+    return conn
+
+
+def get_stat(conn, key):
+    row = conn.execute("SELECT value FROM stats WHERE key=?", (key,)).fetchone()
+    return row[0] if row else 0
+
+
+def inc_stat(conn, key, amount=1):
+    conn.execute("UPDATE stats SET value = value + ? WHERE key=?", (amount, key))
+    conn.commit()
+
+
+def lookup_fix(conn, error_hash, env_hash):
+    """Check cache. Try exact env match first, then any env."""
+    row = conn.execute(
+        "SELECT fix_script FROM fixes WHERE error_hash=? AND env_hash=? AND success_count > fail_count",
+        (error_hash, env_hash)
+    ).fetchone()
+    if row:
+        return row[0], True  # exact match
+
+    row = conn.execute(
+        "SELECT fix_script, env_hash FROM fixes WHERE error_hash=? AND success_count > fail_count ORDER BY success_count DESC LIMIT 1",
+        (error_hash,)
+    ).fetchone()
+    if row:
+        return row[0], False  # fuzzy match
+
+    return None, False
+
+
+def store_fix(conn, error_hash, env_hash, fix_script):
+    conn.execute(
+        "INSERT OR REPLACE INTO fixes (error_hash, env_hash, fix_script, success_count, fail_count, created_at) VALUES (?, ?, ?, 1, 0, ?)",
+        (error_hash, env_hash, fix_script, time.time())
+    )
+    conn.commit()
+
+
+def record_outcome(conn, error_hash, env_hash, success):
+    col = "success_count" if success else "fail_count"
+    conn.execute(
+        f"UPDATE fixes SET {col} = {col} + 1 WHERE error_hash=? AND env_hash=?",
+        (error_hash, env_hash)
+    )
+    conn.commit()
+
+
+# --- Environment Fingerprinting ---
+
+def get_env_fingerprint():
+    """Capture system state for context-aware fix matching."""
+    info = {
+        "os": platform.system(),
+        "release": platform.release(),
+        "machine": platform.machine(),
+        "distro": "",
+        "shell": os.environ.get("SHELL", ""),
+        "python": platform.python_version(),
+    }
+
+    # Linux distro
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("PRETTY_NAME="):
+                    info["distro"] = line.split("=", 1)[1].strip().strip('"')
+                    break
+    except FileNotFoundError:
+        pass
+
+    # Package managers available
+    pms = []
+    for pm in ["apt", "dnf", "pacman", "brew", "pip", "npm", "cargo"]:
+        if shutil.which(pm):
+            pms.append(pm)
+    info["package_managers"] = pms
+
+    return info
+
+
+def env_hash(fingerprint):
+    """Deterministic hash of environment."""
+    canonical = json.dumps(fingerprint, sort_keys=True)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+def error_hash(stderr_text):
+    """Hash the meaningful part of an error message."""
+    lines = stderr_text.strip().splitlines()
+    # Take last 5 lines (usually the actual error, not warnings)
+    significant = "\n".join(lines[-5:]) if len(lines) > 5 else stderr_text.strip()
+    return hashlib.sha256(significant.encode()).hexdigest()[:16]
+
+
+# --- LLM Agent ---
+
+def call_claude(prompt, api_key):
+    """Call Claude API via httpx. Returns the text response."""
+    import httpx
+
+    resp = httpx.post(
+        API_URL,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": MODEL,
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=30,
+    )
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"Claude API error {resp.status_code}: {resp.text[:200]}")
+
+    data = resp.json()
+    return data["content"][0]["text"]
+
+
+def generate_fix(command, stderr_text, env_info, api_key):
+    """Ask Claude to generate a fix for the failed command."""
+    prompt = f"""You are a DevOps agent. A command failed. Generate a fix.
+
+FAILED COMMAND: {command}
+
+ERROR OUTPUT:
+{stderr_text[-2000:]}
+
+SYSTEM INFO:
+- OS: {env_info.get('distro', '')} ({env_info['os']} {env_info['release']})
+- Arch: {env_info['machine']}
+- Shell: {env_info['shell']}
+- Python: {env_info['python']}
+- Package managers: {', '.join(env_info.get('package_managers', []))}
+
+Respond with ONLY a JSON object, no markdown, no explanation:
+{{"fix": "the shell command(s) to run", "explanation": "one line why", "retry": true}}
+
+The "fix" field should contain shell commands that fix the underlying issue.
+Set "retry" to true if the original command should be re-run after the fix.
+Keep it minimal. Prefer the system package manager. Never use sudo unless absolutely necessary."""
+
+    raw = call_claude(prompt, api_key)
+
+    # Parse JSON from response (handle markdown fences)
+    text = raw.strip()
+    if text.startswith("```"):
+        text = "\n".join(text.split("\n")[1:])
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+
+    return json.loads(text)
+
+
+# --- UI ---
+
+C_RESET = "\033[0m"
+C_RED = "\033[31m"
+C_GREEN = "\033[32m"
+C_YELLOW = "\033[33m"
+C_BLUE = "\033[34m"
+C_DIM = "\033[2m"
+C_BOLD = "\033[1m"
+
+# Disable color if not a terminal
+if not sys.stderr.isatty():
+    C_RESET = C_RED = C_GREEN = C_YELLOW = C_BLUE = C_DIM = C_BOLD = ""
+
+
+def status(icon, msg):
+    print(f"  {icon}  {msg}", file=sys.stderr)
+
+
+def show_cache(conn):
+    rows = conn.execute(
+        "SELECT error_hash, env_hash, fix_script, success_count, fail_count, created_at FROM fixes ORDER BY created_at DESC"
+    ).fetchall()
+    if not rows:
+        print("Cache is empty.")
+        return
+    print(f"\n{'HASH':<18} {'ENV':<18} {'OK':>4} {'FAIL':>4}  FIX")
+    print("-" * 80)
+    for r in rows:
+        fix_preview = r[2][:40].replace("\n", " ")
+        print(f"{r[0]:<18} {r[1]:<18} {r[3]:>4} {r[4]:>4}  {fix_preview}")
+    print()
+
+
+def show_stats(conn):
+    print(f"\n  Total spend:     ${get_stat(conn, 'total_spend_cents') / 100:.4f}")
+    print(f"  Fixes generated: {int(get_stat(conn, 'fixes_generated'))}")
+    print(f"  Fixes served:    {int(get_stat(conn, 'fixes_served'))}")
+    print()
+
+
+# --- Main Loop ---
+
+def run_fix(args):
+    conn = init_db()
+    command = " ".join(args)
+
+    # Budget check
+    budget = float(os.environ.get("FIX_BUDGET_CENTS", DEFAULT_BUDGET_CENTS))
+    session_spend = get_stat(conn, "session_spend_cents")
+
+    # Run the command
+    status(f"{C_BLUE}>{C_RESET}", f"{C_BOLD}{command}{C_RESET}")
+    proc = subprocess.run(command, shell=True, capture_output=True, text=True)
+
+    if proc.stdout:
+        sys.stdout.write(proc.stdout)
+    if proc.returncode == 0:
+        if proc.stderr:
+            sys.stderr.write(proc.stderr)
+        return 0
+
+    # Command failed
+    sys.stderr.write(proc.stderr)
+    status(f"{C_RED}!{C_RESET}", f"Exited {proc.returncode}")
+
+    if not proc.stderr.strip():
+        status(f"{C_DIM}?{C_RESET}", "No stderr to analyze.")
+        return proc.returncode
+
+    # Fingerprint
+    env_info = get_env_fingerprint()
+    ehash = error_hash(proc.stderr)
+    envhash = env_hash(env_info)
+
+    status(f"{C_DIM}#{C_RESET}", f"error={ehash} env={envhash}")
+
+    # Check cache
+    cached_fix, exact = lookup_fix(conn, ehash, envhash)
+    if cached_fix:
+        match_type = "exact" if exact else "fuzzy"
+        status(f"{C_GREEN}${C_RESET}", f"Cache hit ({match_type}): {C_DIM}{cached_fix[:60]}{C_RESET}")
+        inc_stat(conn, "fixes_served")
+
+        confirm = input(f"  ?  Apply cached fix? [Y/n] ")
+        if confirm.strip().lower() == "n":
+            return proc.returncode
+
+        status(f"{C_YELLOW}*{C_RESET}", "Applying fix...")
+        fix_proc = subprocess.run(cached_fix, shell=True)
+        if fix_proc.returncode != 0:
+            status(f"{C_RED}!{C_RESET}", "Fix command failed.")
+            record_outcome(conn, ehash, envhash, False)
+            return fix_proc.returncode
+
+        # Retry original
+        status(f"{C_BLUE}>{C_RESET}", f"Retrying: {command}")
+        retry = subprocess.run(command, shell=True)
+        success = retry.returncode == 0
+        record_outcome(conn, ehash, envhash, success)
+        if success:
+            status(f"{C_GREEN}+{C_RESET}", "Fixed.")
+        else:
+            status(f"{C_RED}!{C_RESET}", "Still failing after fix.")
+        return retry.returncode
+
+    # Cache miss — ask the LLM
+    api_key = get_api_key()
+    if not api_key:
+        status(f"{C_RED}!{C_RESET}", "No fix in cache and no API key.")
+        status(f"{C_DIM}i{C_RESET}", "Set ANTHROPIC_API_KEY or write key to ~/.patchdao/api_key")
+        return proc.returncode
+
+    if session_spend + COST_PER_CALL_CENTS > budget:
+        status(f"{C_RED}!{C_RESET}", f"Budget exhausted (${session_spend/100:.2f}/${budget/100:.2f})")
+        return proc.returncode
+
+    status(f"{C_YELLOW}@{C_RESET}", "Cache miss. Asking Claude...")
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            result = generate_fix(command, proc.stderr, env_info, api_key)
+            break
+        except json.JSONDecodeError:
+            if attempt < MAX_RETRIES - 1:
+                status(f"{C_DIM}~{C_RESET}", "Bad response, retrying...")
+                continue
+            status(f"{C_RED}!{C_RESET}", "Could not parse fix from Claude.")
+            return proc.returncode
+        except RuntimeError as e:
+            status(f"{C_RED}!{C_RESET}", str(e))
+            return proc.returncode
+
+    inc_stat(conn, "session_spend_cents", COST_PER_CALL_CENTS)
+    inc_stat(conn, "total_spend_cents", COST_PER_CALL_CENTS)
+    inc_stat(conn, "fixes_generated")
+
+    fix_cmd = result["fix"]
+    explanation = result.get("explanation", "")
+    should_retry = result.get("retry", True)
+
+    status(f"{C_GREEN}${C_RESET}", f"Fix: {C_BOLD}{fix_cmd[:80]}{C_RESET}")
+    if explanation:
+        status(f"{C_DIM}i{C_RESET}", explanation)
+    status(f"{C_DIM}~{C_RESET}", f"Cost: ~${COST_PER_CALL_CENTS/100:.4f}")
+
+    confirm = input(f"  ?  Apply this fix? [Y/n] ")
+    if confirm.strip().lower() == "n":
+        return proc.returncode
+
+    status(f"{C_YELLOW}*{C_RESET}", "Applying fix...")
+    fix_proc = subprocess.run(fix_cmd, shell=True)
+
+    if fix_proc.returncode != 0:
+        status(f"{C_RED}!{C_RESET}", "Fix command failed.")
+        return fix_proc.returncode
+
+    if should_retry:
+        status(f"{C_BLUE}>{C_RESET}", f"Retrying: {command}")
+        retry = subprocess.run(command, shell=True)
+
+        if retry.returncode == 0:
+            status(f"{C_GREEN}+{C_RESET}", "Fixed! Caching solution.")
+            store_fix(conn, ehash, envhash, fix_cmd)
+            return 0
+        else:
+            status(f"{C_RED}!{C_RESET}", "Still failing. Fix not cached.")
+            return retry.returncode
+    else:
+        status(f"{C_GREEN}+{C_RESET}", "Fix applied. Caching solution.")
+        store_fix(conn, ehash, envhash, fix_cmd)
+        return 0
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        return
+
+    if sys.argv[1] == "--cache":
+        conn = init_db()
+        show_cache(conn)
+        return
+
+    if sys.argv[1] == "--stats":
+        conn = init_db()
+        show_stats(conn)
+        return
+
+    if sys.argv[1] == "--clear":
+        conn = init_db()
+        conn.execute("DELETE FROM fixes")
+        conn.commit()
+        print("Cache cleared.")
+        return
+
+    sys.exit(run_fix(sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    main()
